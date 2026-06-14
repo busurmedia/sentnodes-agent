@@ -1,0 +1,11 @@
+SentNodes Agent
+Copyright 2026 Busur Media Indonesia, PT (Busurnode), https://busurnode.com
+
+This product is developed and maintained by Busur Media Indonesia, PT (operating as
+Busurnode) as the companion agent for SentNodes (https://sentnodes.com), a
+monitoring and management dashboard for the Sentinel dVPN node network.
+
+Forks and redistributions must retain this NOTICE and the LICENSE, and state any
+changes (Apache License 2.0, sections 4(b) and 4(d)). "SentNodes", "Busurnode",
+and "Busur Media Indonesia, PT" are names of the project and its operator and are
+not licensed for use except as permitted by the Apache License 2.0 (section 6).

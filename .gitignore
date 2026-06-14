@@ -1,0 +1,5 @@
+/sentagent
+/sentagent-*
+/dist/
+*.exe
+.env
