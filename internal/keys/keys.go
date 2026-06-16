@@ -18,12 +18,27 @@ import (
 	"github.com/busurmedia/sentnodes-agent/internal/bech32"
 )
 
-// Account is the operator key loaded from the keyring.
-type Account struct {
-	priv          *secp256k1.PrivateKey
+// Identity is the public part of the operator key: its compressed pubkey and
+// derived addresses. It holds no private key, so it is safe to keep for the
+// whole process lifetime (the private key is wiped after each use - see Wipe).
+type Identity struct {
 	pubCompressed []byte
 	operatorAddr  string
 	nodeAddr      string
+}
+
+func (i Identity) OperatorAddr() string { return i.operatorAddr }
+func (i Identity) NodeAddr() string     { return i.nodeAddr }
+func (i Identity) PubKeyHex() string    { return hex.EncodeToString(i.pubCompressed) }
+func (i Identity) PubKeyBytes() []byte  { return i.pubCompressed }
+
+// Account is a short-lived signing handle: the public Identity plus the
+// in-memory private key. Open it only to sign (enrollment challenge,
+// withdrawals) and Wipe it immediately after, so the operator key is never
+// resident for the process lifetime, long-lived callers keep only the Identity.
+type Account struct {
+	Identity
+	priv *secp256k1.PrivateKey
 }
 
 // Open loads the key named fromName from the cosmos `test` keyring under
@@ -54,6 +69,9 @@ func Open(nodeHome, backend, name, acctPrefix, nodePrefix string) (*Account, err
 
 	priv := secp256k1.PrivKeyFromBytes(keyBytes)
 	pub := priv.PubKey().SerializeCompressed()
+	for i := range keyBytes { // don't leave the raw key bytes lingering in memory
+		keyBytes[i] = 0
+	}
 
 	sha := sha256.Sum256(pub)
 	rmd := ripemd160.New()
@@ -69,13 +87,20 @@ func Open(nodeHome, backend, name, acctPrefix, nodePrefix string) (*Account, err
 		return nil, err
 	}
 
-	return &Account{priv: priv, pubCompressed: pub, operatorAddr: opAddr, nodeAddr: ndAddr}, nil
+	return &Account{
+		Identity: Identity{pubCompressed: pub, operatorAddr: opAddr, nodeAddr: ndAddr},
+		priv:     priv,
+	}, nil
 }
 
-func (a *Account) OperatorAddr() string { return a.operatorAddr }
-func (a *Account) NodeAddr() string     { return a.nodeAddr }
-func (a *Account) PubKeyHex() string    { return hex.EncodeToString(a.pubCompressed) }
-func (a *Account) PubKeyBytes() []byte  { return a.pubCompressed }
+// Wipe zeroes the in-memory private key. After Wipe the Account must not be used
+// to Sign; open a fresh Account when a signature is next needed.
+func (a *Account) Wipe() {
+	if a.priv != nil {
+		a.priv.Zero()
+		a.priv = nil
+	}
+}
 
 // Sign signs the raw message bytes the cosmos way (ECDSA over sha256(msg),
 // low-S, 64-byte r||s) and returns the raw signature.

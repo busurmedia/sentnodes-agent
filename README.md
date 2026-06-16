@@ -23,15 +23,12 @@ queue, never reads your keys, and never connects to your node itself.
 - The node keyring uses `backend = "test"` (an unattended agent cannot enter a
   passphrase; the agent refuses to start otherwise).
 - The agent shares the node's home directory (it reads `config.toml` and the
-  keyring there) and can reach the Docker daemon (socket or a socket-proxy).
+  keyring there) and can reach the Docker daemon (via direct socket or a socket-proxy).
 
 dVPN nodes use `/root/.sentinel-dvpnx` inside the node container, which is
 commonly bind-mounted from `${HOME}/.sentinel-dvpnx` on the host (per the
 [node config docs](https://docs.sentinel.co/dvpn-nodes/setup/manual/node-config)).
 The agent mounts that same host directory at the same path.
-
-The agent image runs as root so it can read the node's root-owned keyring and
-config and write `config.toml`; the Docker socket-proxy is the containment layer.
 
 ## Quick start (plain docker, no compose)
 
@@ -82,6 +79,39 @@ and a minimum balance always kept (default 50 P2P).
 | `WITHDRAWAL_MIN` | no | Minimum single withdrawal, in P2P (default 250; min 50). |
 | `WITHDRAWAL_RESERVE` | no | Balance always kept, in P2P (default 50; min 50). |
 | `DVPN_NODE_CONTAINER` | no | Only to disambiguate if volume auto-discovery is ambiguous. |
+| `DOCKER_HOST` | no | Docker endpoint. Defaults to `unix:///var/run/docker.sock`. If you're using a Docker socket-proxy, you can put the proxy address here, eg: `tcp://socket-proxy:2375`. |
+
+### Using a socket-proxy (optional hardening)
+
+Instead of bind-mounting the Docker socket into the agent, you can front the
+daemon with a socket-proxy that exposes only the few endpoints the agent uses
+(list/inspect containers, watch events, restart), then point the agent at it with
+`DOCKER_HOST`. The agent itself then needs no socket mount:
+
+```yaml
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    environment:
+      CONTAINERS: 1   # list + inspect + stats (GET /containers/...)
+      EVENTS: 1       # stream container status changes
+      POST: 1         # allow the restart call (POST /containers/.../restart)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  sentnodes-agent:
+    image: ghcr.io/busurmedia/sentnodes-agent:latest
+    environment:
+      SENTNODES_AGENT_KEY: "paste-your-agent-key"
+      WITHDRAWAL_ADDRESS: "sent1xxxxxxxxxxxxxxxx"   # optional
+      DOCKER_HOST: "tcp://socket-proxy:2375"
+    volumes:
+      - ${HOME}/.sentinel-dvpnx:/root/.sentinel-dvpnx
+    depends_on:
+      - socket-proxy
+    restart: unless-stopped
+```
 
 ## Troubleshooting
 

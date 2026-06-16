@@ -22,10 +22,10 @@ import (
 )
 
 // Status reports the node's identity and current local config (read-only).
-func Status(cfg *config.Config, acct *keys.Account) map[string]interface{} {
+func Status(cfg *config.Config, id keys.Identity) map[string]interface{} {
 	return map[string]interface{}{
-		"operator":       acct.OperatorAddr(),
-		"node":           acct.NodeAddr(),
+		"operator":       id.OperatorAddr(),
+		"node":           id.NodeAddr(),
 		"gigabytePrices": cfg.GigabytePrices,
 		"hourlyPrices":   cfg.HourlyPrices,
 		"rpcAddrs":       cfg.RPCAddrs,
@@ -133,7 +133,7 @@ func readOsmosisAddr(path string) string {
 // Withdraw sends udvpn from the operator account to the env-pinned destination (never the
 // server). When all is true it withdraws everything above the reserve, computed from the
 // live balance; idemKey guards double-sends via a local log and the on-chain sequence.
-func Withdraw(ctx context.Context, cfg *config.Config, acct *keys.Account, amount uint64, all bool, idemKey string) (string, error) {
+func Withdraw(ctx context.Context, cfg *config.Config, amount uint64, all bool, idemKey string) (string, error) {
 	if cfg.WithdrawAddr == "" {
 		return "", errors.New("withdrawals disabled: WITHDRAWAL_ADDRESS is not set")
 	}
@@ -143,9 +143,16 @@ func Withdraw(ctx context.Context, cfg *config.Config, acct *keys.Account, amoun
 		return h, nil
 	}
 
+	// Open the operator key only to sign this withdrawal, then wipe it from memory
+	signer, err := keys.Open(cfg.NodeHome, cfg.KeyringBackend, cfg.FromName, "sent", "sentnode")
+	if err != nil {
+		return "", fmt.Errorf("open key: %w", err)
+	}
+	defer signer.Wipe()
+
 	c := chain.New(cfg.RPCEndpoints())
 	fee := computeFee(cfg.Gas, cfg.GasPrices)
-	bal, err := c.Balance(ctx, acct.OperatorAddr(), "udvpn")
+	bal, err := c.Balance(ctx, signer.OperatorAddr(), "udvpn")
 	if err != nil {
 		return "", fmt.Errorf("query balance: %w", err)
 	}
@@ -169,13 +176,13 @@ func Withdraw(ctx context.Context, cfg *config.Config, acct *keys.Account, amoun
 		return "", fmt.Errorf("would leave less than the %s P2P reserve: amount %s P2P (+%s fee), balance %s P2P", p2p(cfg.WithdrawReserve), p2p(amount), p2p(fee), p2p(bal))
 	}
 
-	num, seq, err := c.Account(ctx, acct.OperatorAddr())
+	num, seq, err := c.Account(ctx, signer.OperatorAddr())
 	if err != nil {
 		return "", fmt.Errorf("query account: %w", err)
 	}
 
 	memo := "SentNodes Agent Withdrawal"
-	txBytes := chain.BuildSignedSend(acct, cfg.ChainID, cfg.WithdrawAddr, "udvpn", amount, fee, cfg.Gas, num, seq, memo)
+	txBytes := chain.BuildSignedSend(signer, cfg.ChainID, cfg.WithdrawAddr, "udvpn", amount, fee, cfg.Gas, num, seq, memo)
 	h, err := c.Broadcast(ctx, txBytes)
 	if err != nil {
 		return h, err

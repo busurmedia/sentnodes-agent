@@ -26,7 +26,7 @@ type Runner struct {
 	cfg     *config.Config
 	cli     *api.Client
 	dk      *dockerx.Docker
-	acct    *keys.Account
+	id      keys.Identity
 	token   string
 	version string
 
@@ -71,11 +71,17 @@ func Run(ctx context.Context, version string) error {
 		r.cfg.WithdrawReserve = config.WithdrawFloorUdvpn
 	}
 
-	// Hard prerequisite: load the operator key (also enforces backend=test).
-	r.acct, err = keys.Open(cfg.NodeHome, cfg.KeyringBackend, cfg.FromName, "sent", "sentnode")
+	// Load the operator key once at startup: derive the node identity and fail
+	// fast on a bad keyring (this also enforces backend=test). We do NOT keep the
+	// private key in-memory, retain only the public Identity and wipe the key. It
+	// is re-opened transiently only to sign (enrollment, withdrawals), the same
+	// way the dvpn node's keyring reads it per-signature.
+	signer, err := r.openSigner()
 	if err != nil {
 		return err
 	}
+	r.id = signer.Identity
+	signer.Wipe()
 	r.signals.Keyring = true
 
 	// Hard prerequisites, checked individually so the failure reason is explicit.
@@ -106,10 +112,16 @@ func Run(ctx context.Context, version string) error {
 		return nil // context canceled while waiting to register
 	}
 	r.signals.Server = true
-	log.Printf("enrolled node %s (operator %s)", r.acct.NodeAddr(), r.acct.OperatorAddr())
+	log.Printf("enrolled node %s (operator %s)", r.id.NodeAddr(), r.id.OperatorAddr())
 	log.Printf("SentNodes Agent %s successfully started", r.version)
 
 	return r.loop(ctx)
+}
+
+// openSigner opens the operator key as a transient signing handle. Callers Wipe
+// it as soon as they finish signing so the private key is never kept resident.
+func (r *Runner) openSigner() (*keys.Account, error) {
+	return keys.Open(r.cfg.NodeHome, r.cfg.KeyringBackend, r.cfg.FromName, "sent", "sentnode")
 }
 
 // ensureEnrolled registers, retrying every 10m until it succeeds. A fresh node
@@ -122,7 +134,7 @@ func (r *Runner) ensureEnrolled(ctx context.Context) error {
 		}
 		var apiErr *api.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "NODE_UNKNOWN" {
-			log.Printf("node %s is not indexed by SentNodes yet, retrying registration in 10m", r.acct.NodeAddr())
+			log.Printf("node %s is not indexed by SentNodes yet, retrying registration in 10m", r.id.NodeAddr())
 		} else {
 			log.Printf("registration failed: %v; retrying in 10m", err)
 		}
@@ -147,6 +159,26 @@ func (r *Runner) reenroll(ctx context.Context) {
 	_ = r.ensureEnrolled(ctx)
 }
 
+// refreshIdentity re-reads the operator key after a node restart and re-enrolls if
+// the node wallet changed. Opens the keyring only on this event, in the loop goroutine.
+func (r *Runner) refreshIdentity(ctx context.Context) {
+	signer, err := r.openSigner()
+	if err != nil {
+		log.Printf("identity refresh after node restart: %v", err)
+		return
+	}
+	newID := signer.Identity
+	signer.Wipe()
+	if newID.NodeAddr() == r.id.NodeAddr() {
+		return
+	}
+	log.Printf("node wallet changed (%s -> %s); re-registering as the new node", r.id.NodeAddr(), newID.NodeAddr())
+	r.id = newID
+	_ = os.Remove(r.cfg.StatePath())
+	r.token = ""
+	_ = r.ensureEnrolled(ctx)
+}
+
 func (r *Runner) enroll() error {
 	addr, t := readState(r.cfg.StatePath())
 	if t != "" {
@@ -155,26 +187,34 @@ func (r *Runner) enroll() error {
 			// Legacy token (no bound node address): adopt it for the current node and
 			// upgrade the state file in place - no re-register needed.
 			r.token = t
-			_ = writeState(r.cfg.StatePath(), r.acct.NodeAddr(), t)
+			_ = writeState(r.cfg.StatePath(), r.id.NodeAddr(), t)
 			return nil
-		case addr == r.acct.NodeAddr():
+		case addr == r.id.NodeAddr():
 			r.token = t
 			return nil
 		default:
 			// The operator key changed, so the node address changed under us - the
 			// stored token belongs to a different node. Re-enroll as the new node.
-			log.Printf("node identity changed (%s -> %s); re-registering", addr, r.acct.NodeAddr())
+			log.Printf("node identity changed (%s -> %s); re-registering", addr, r.id.NodeAddr())
 		}
 	}
-	ch, err := r.cli.Challenge(r.acct.NodeAddr(), r.cfg.APIKey)
+	// Registration needs a signature, so open the key transiently and wipe it as
+	// soon as we are done - it is not retained after enrollment.
+	signer, err := r.openSigner()
+	if err != nil {
+		return err
+	}
+	defer signer.Wipe()
+
+	ch, err := r.cli.Challenge(signer.NodeAddr(), r.cfg.APIKey)
 	if err != nil {
 		return err
 	}
 	reg, err := r.cli.Register(r.cfg.APIKey, wire.RegisterReq{
-		NodeAddr:            r.acct.NodeAddr(),
-		OperatorAddr:        r.acct.OperatorAddr(),
-		Pubkey:              r.acct.PubKeyHex(),
-		Signature:           r.acct.SignHex([]byte(ch.Nonce)),
+		NodeAddr:            signer.NodeAddr(),
+		OperatorAddr:        signer.OperatorAddr(),
+		Pubkey:              signer.PubKeyHex(),
+		Signature:           signer.SignHex([]byte(ch.Nonce)),
 		HostId:              r.hostID,
 		NodeContainer:       r.containerName,
 		Version:             r.version,
@@ -186,7 +226,7 @@ func (r *Runner) enroll() error {
 		return err
 	}
 	r.token = reg.AgentToken
-	return writeState(r.cfg.StatePath(), r.acct.NodeAddr(), r.token)
+	return writeState(r.cfg.StatePath(), signer.NodeAddr(), r.token)
 }
 
 func (r *Runner) loop(ctx context.Context) error {
@@ -197,7 +237,8 @@ func (r *Runner) loop(ctx context.Context) error {
 	defer hbT.Stop()
 	defer metricsT.Stop()
 
-	go r.watchEvents(ctx)
+	settled := make(chan struct{}, 1)
+	go r.watchEvents(ctx, settled)
 
 	// Poll first: it re-enrolls on a rejected token, so the heartbeat + metrics
 	// below use a valid token and populate immediately instead of lagging a tick.
@@ -215,6 +256,9 @@ func (r *Runner) loop(ctx context.Context) error {
 			r.heartbeat(ctx)
 		case <-metricsT.C:
 			r.sendMetrics(ctx)
+		case <-settled:
+			r.refreshIdentity(ctx)
+			r.heartbeat(ctx)
 		}
 	}
 }
@@ -314,14 +358,14 @@ func (r *Runner) applyConfig(c wire.Command) (bool, map[string]interface{}) {
 func (r *Runner) execute(ctx context.Context, c wire.Command) (bool, map[string]interface{}) {
 	switch c.Type {
 	case "status":
-		return true, exec.Status(r.cfg, r.acct)
+		return true, exec.Status(r.cfg, r.id)
 	case "withdraw":
 		all, _ := c.Payload["all"].(bool)
 		amt, _ := toUint(c.Payload["amount"])
 		if !all && amt == 0 {
 			return false, fail("invalid withdrawal amount")
 		}
-		h, err := exec.Withdraw(ctx, r.cfg, r.acct, amt, all, c.ID)
+		h, err := exec.Withdraw(ctx, r.cfg, amt, all, c.ID)
 		if err != nil {
 			return false, fail(err.Error())
 		}
@@ -385,7 +429,7 @@ func (r *Runner) heartbeat(ctx context.Context) {
 	}
 }
 
-func (r *Runner) watchEvents(ctx context.Context) {
+func (r *Runner) watchEvents(ctx context.Context, settled chan<- struct{}) {
 	if r.dk == nil || r.containerID == "" {
 		return
 	}
@@ -404,7 +448,11 @@ func (r *Runner) watchEvents(ctx context.Context) {
 				}
 				debounce.Reset(2 * time.Second) // collapse stop+die+start into the settled state
 			case <-debounce.C:
-				r.heartbeat(ctx)
+				// Hand off to the loop goroutine (it owns r.id/r.token); non-blocking + coalesced.
+				select {
+				case settled <- struct{}{}:
+				default:
+				}
 			}
 		}
 	reconnect:
